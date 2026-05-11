@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # 微信多开管理脚本 - 交互式增强版
-# 支持无限多开、智能检测、增量创建、一键恢复
+# 支持增量创建、选择启动、图标自定义、一键恢复
 # 使用方法: chmod +x wechat-multi-open.sh && ./wechat-multi-open.sh
 #
 
@@ -10,6 +10,7 @@ set -euo pipefail
 # ==================== 配置 ====================
 SRC="/Applications/WeChat.app"
 BASE_BUNDLE_ID="com.tencent.xinWeChat"
+MAX_TOTAL_INSTANCES=20
 
 # ==================== 颜色输出 ====================
 GREEN='\033[0;32m'
@@ -27,22 +28,58 @@ title() { echo -e "${CYAN}${BOLD}$1${NC}"; }
 
 # ==================== 核心功能 ====================
 
+copy_app_path() {
+    echo "/Applications/WeChat${1}.app"
+}
+
+copy_bundle_id() {
+    echo "${BASE_BUNDLE_ID}${1}"
+}
+
+ensure_dependencies() {
+    [ -d "$SRC" ] || error "未找到原版微信: $SRC"
+    [ -x /usr/libexec/PlistBuddy ] || error "未找到 /usr/libexec/PlistBuddy"
+    command -v codesign >/dev/null 2>&1 || error "未找到 codesign"
+    command -v osascript >/dev/null 2>&1 || error "未找到 osascript"
+}
+
+set_plist_string() {
+    local plist=$1
+    local key=$2
+    local value=$3
+
+    sudo /usr/libexec/PlistBuddy -c "Set :${key} ${value}" "$plist" >/dev/null 2>&1 || \
+        sudo /usr/libexec/PlistBuddy -c "Add :${key} string ${value}" "$plist" >/dev/null 2>&1
+}
+
+resign_app() {
+    local app=$1
+    sudo codesign --force --deep --sign - "$app" >/dev/null 2>&1
+}
+
+cleanup_partial_copy() {
+    local app=$1
+    if [ -d "$app" ]; then
+        sudo rm -rf "$app" >/dev/null 2>&1 || true
+    fi
+}
+
+quit_app_by_bundle_id() {
+    local bundle_id=$1
+    osascript -e "tell application id \"$bundle_id\" to quit" >/dev/null 2>&1 || true
+}
+
 # 扫描现有微信副本
 scan_wechat_copies() {
     local copies=()
     for i in {2..99}; do
-        local app="/Applications/WeChat${i}.app"
+        local app
+        app="$(copy_app_path "$i")"
         if [ -d "$app" ]; then
             copies+=("$i")
         fi
     done
     echo "${copies[@]:-}"
-}
-
-# 获取副本数量
-get_copy_count() {
-    local copies=($(scan_wechat_copies))
-    echo "${#copies[@]}"
 }
 
 # 显示当前状态
@@ -81,47 +118,69 @@ show_status() {
 # 创建微信副本
 create_copy() {
     local num=$1
-    local dst="/Applications/WeChat${num}.app"
-    local bundle_id="${BASE_BUNDLE_ID}${num}"
+    local dst
+    local bundle_id
+    local plist
+    dst="$(copy_app_path "$num")"
+    bundle_id="$(copy_bundle_id "$num")"
+    plist="$dst/Contents/Info.plist"
 
     echo ""
     info "正在创建 WeChat${num}.app..."
 
     # 复制应用
     echo -n "  [1/6] 复制应用文件..."
-    sudo cp -R "$SRC" "$dst" 2>/dev/null
-    echo -e " ${GREEN}完成${NC}"
+    if sudo cp -R "$SRC" "$dst" >/dev/null 2>&1; then
+        echo -e " ${GREEN}完成${NC}"
+    else
+        cleanup_partial_copy "$dst"
+        error "复制应用失败: $dst"
+    fi
 
     # 修改 Bundle ID
     echo -n "  [2/6] 修改 Bundle ID..."
-    sudo /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $bundle_id" \
-        "$dst/Contents/Info.plist" 2>/dev/null
-    echo -e " ${GREEN}完成${NC}"
+    if set_plist_string "$plist" "CFBundleIdentifier" "$bundle_id"; then
+        echo -e " ${GREEN}完成${NC}"
+    else
+        cleanup_partial_copy "$dst"
+        error "修改 Bundle ID 失败: $dst"
+    fi
 
     # 修改显示名称
     echo -n "  [3/6] 修改显示名称..."
-    sudo /usr/libexec/PlistBuddy -c "Set :CFBundleName WeChat${num}" \
-        "$dst/Contents/Info.plist" 2>/dev/null || true
-    sudo /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName WeChat${num}" \
-        "$dst/Contents/Info.plist" 2>/dev/null || true
-    echo -e " ${GREEN}完成${NC}"
+    if set_plist_string "$plist" "CFBundleName" "WeChat${num}" && \
+        set_plist_string "$plist" "CFBundleDisplayName" "WeChat${num}"; then
+        echo -e " ${GREEN}完成${NC}"
+    else
+        cleanup_partial_copy "$dst"
+        error "修改显示名称失败: $dst"
+    fi
 
     # 清除扩展属性
     echo -n "  [4/6] 清除扩展属性..."
-    sudo xattr -cr "$dst" 2>/dev/null || true
-    echo -e " ${GREEN}完成${NC}"
+    if sudo xattr -cr "$dst" >/dev/null 2>&1; then
+        echo -e " ${GREEN}完成${NC}"
+    else
+        echo -e " ${YELLOW}跳过${NC}"
+    fi
 
     # 重新签名
     echo -n "  [5/6] 重新签名..."
-    sudo codesign --force --deep --sign - "$dst" 2>/dev/null || {
-        echo -e " ${YELLOW}警告${NC}"
-    }
-    echo -e " ${GREEN}完成${NC}"
+    if resign_app "$dst"; then
+        echo -e " ${GREEN}完成${NC}"
+    else
+        cleanup_partial_copy "$dst"
+        error "重新签名失败，已移除未完成的副本: $dst"
+    fi
 
     # 修复权限
     echo -n "  [6/6] 修复权限..."
-    sudo chown -R "$(whoami)" "$dst" 2>/dev/null
-    echo -e " ${GREEN}完成${NC}"
+    if sudo chown -R "$(whoami)" "$dst" >/dev/null 2>&1; then
+        echo -e " ${GREEN}完成${NC}"
+    else
+        echo -e " ${YELLOW}警告${NC}"
+        warn "副本已创建，但权限仍归 root 所有: $dst"
+    fi
 
     info "WeChat${num}.app 创建成功！"
 }
@@ -185,7 +244,7 @@ remove_all_copies() {
     title "  恢复单开模式"
     title "=========================================="
     echo ""
-    warn "将删除以下 ${count} 个副本:"
+    warn "将删除以下 ${count} 个副本（不会删除原版 WeChat.app）:"
     for i in "${copies[@]}"; do
         echo "   - WeChat${i}.app"
     done
@@ -201,17 +260,22 @@ remove_all_copies() {
     echo ""
     info "正在删除副本..."
 
-    # 先停止所有进程
+    # 先关闭所有副本
     for i in "${copies[@]}"; do
-        killall "WeChat${i}" 2>/dev/null || true
+        quit_app_by_bundle_id "$(copy_bundle_id "$i")"
     done
+    sleep 1
 
     # 删除应用
     for i in "${copies[@]}"; do
-        local app="/Applications/WeChat${i}.app"
+        local app
+        app="$(copy_app_path "$i")"
         echo -n "  删除 WeChat${i}.app..."
-        sudo rm -rf "$app"
-        echo -e " ${GREEN}完成${NC}"
+        if sudo rm -rf "$app" >/dev/null 2>&1; then
+            echo -e " ${GREEN}完成${NC}"
+        else
+            error "删除失败: $app"
+        fi
     done
 
     # 清理数据目录（可选）
@@ -222,8 +286,11 @@ remove_all_copies() {
             local data_dir="${HOME}/Library/Containers/${BASE_BUNDLE_ID}${i}"
             if [ -d "$data_dir" ]; then
                 echo -n "  清理数据: WeChat${i}..."
-                rm -rf "$data_dir"
-                echo -e " ${GREEN}完成${NC}"
+                if rm -rf "$data_dir"; then
+                    echo -e " ${GREEN}完成${NC}"
+                else
+                    error "清理数据目录失败: $data_dir"
+                fi
             fi
         done
     fi
@@ -276,7 +343,7 @@ remove_selected_copies() {
     fi
 
     echo ""
-    warn "将删除以下 ${#to_delete[@]} 个副本:"
+    warn "将删除以下 ${#to_delete[@]} 个副本（不会删除原版 WeChat.app）:"
     for i in "${to_delete[@]}"; do
         echo "   - WeChat${i}.app"
     done
@@ -293,10 +360,14 @@ remove_selected_copies() {
 
     # 停止进程并删除
     for i in "${to_delete[@]}"; do
-        killall "WeChat${i}" 2>/dev/null || true
+        quit_app_by_bundle_id "$(copy_bundle_id "$i")"
+        sleep 1
         echo -n "  删除 WeChat${i}.app..."
-        sudo rm -rf "/Applications/WeChat${i}.app"
-        echo -e " ${GREEN}完成${NC}"
+        if sudo rm -rf "$(copy_app_path "$i")" >/dev/null 2>&1; then
+            echo -e " ${GREEN}完成${NC}"
+        else
+            error "删除失败: $(copy_app_path "$i")"
+        fi
     done
 
     # 清理数据目录（可选）
@@ -307,8 +378,11 @@ remove_selected_copies() {
             local data_dir="${HOME}/Library/Containers/${BASE_BUNDLE_ID}${i}"
             if [ -d "$data_dir" ]; then
                 echo -n "  清理数据: WeChat${i}..."
-                rm -rf "$data_dir"
-                echo -e " ${GREEN}完成${NC}"
+                if rm -rf "$data_dir"; then
+                    echo -e " ${GREEN}完成${NC}"
+                else
+                    error "清理数据目录失败: $data_dir"
+                fi
             fi
         done
     fi
@@ -390,7 +464,7 @@ launch_selected() {
             echo "  启动 WeChat.app (原版)"
         else
             sleep 0.5
-            open -a "/Applications/WeChat${num}.app"
+            open -a "$(copy_app_path "$num")"
             echo "  启动 WeChat${num}.app"
         fi
     done
@@ -401,16 +475,19 @@ launch_selected() {
 
 # 停止所有微信进程
 stop_all() {
+    local copies=($(scan_wechat_copies))
+
     echo ""
     info "正在停止所有微信进程..."
 
-    killall WeChat 2>/dev/null || true
-    local copies=($(scan_wechat_copies))
+    quit_app_by_bundle_id "$BASE_BUNDLE_ID"
     for i in "${copies[@]}"; do
-        killall "WeChat${i}" 2>/dev/null || true
+        quit_app_by_bundle_id "$(copy_bundle_id "$i")"
     done
-
     sleep 1
+
+    killall WeChat 2>/dev/null || true
+
     info "所有微信进程已停止"
 }
 
@@ -425,7 +502,10 @@ customize_icon() {
     fi
 
     # 使用相对路径获取 icon 目录
-    local icon_dir="$(dirname "${BASH_SOURCE[0]}")/icon"
+    local script_dir
+    local icon_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    icon_dir="${script_dir}/icon"
 
     # 检查 icon 目录是否存在
     if [ ! -d "$icon_dir" ]; then
@@ -512,35 +592,32 @@ customize_icon() {
     info "正在替换图标..."
 
     for i in "${to_customize[@]}"; do
-        local app="/Applications/WeChat${i}.app"
-        local target_icon="$app/Contents/Resources/AppIcon.icns"
+        local app
+        local target_icon
+        app="$(copy_app_path "$i")"
+        target_icon="$app/Contents/Resources/AppIcon.icns"
         echo -n "  WeChat${i}.app..."
 
         # 替换图标文件
-        sudo cp "$selected_icon" "$target_icon"
+        if ! sudo cp "$selected_icon" "$target_icon" >/dev/null 2>&1; then
+            error "替换图标文件失败: $target_icon"
+        fi
 
-        # 清除 app 的图标缓存
-        sudo rm -rf "$app/Icon$'\r'" 2>/dev/null || true
+        if ! resign_app "$app"; then
+            error "图标已替换，但重新签名失败: $app"
+        fi
 
-        # 更新 app 的修改时间
-        sudo touch "$app"
-
+        sudo touch "$target_icon" "$app" >/dev/null 2>&1 || true
         echo -e " ${GREEN}完成${NC}"
     done
 
     echo ""
-    info "正在清除系统图标缓存并刷新 Dock..."
-
-    # 清除系统图标缓存
-    sudo rm -rf /Library/Caches/com.apple.iconservices.store 2>/dev/null || true
-    sudo find /private/var/folders/ -name com.apple.iconservices -exec rm -rf {} \; 2>/dev/null || true
-
-    # 刷新 Dock
+    info "正在刷新 Dock 图标缓存..."
     killall Dock 2>/dev/null || true
 
     echo ""
     info "图标替换完成！Dock 已刷新"
-    info "提示: 如果图标未立即更新，请稍等几秒或重启 Finder"
+    info "提示: 如果图标未立即更新，请稍等几秒或手动重启 Finder"
 }
 
 # ==================== 交互式菜单 ====================
@@ -560,8 +637,7 @@ show_menu() {
 
 # ==================== 主函数 ====================
 main() {
-    # 检查原版微信
-    [ ! -d "$SRC" ] && error "未找到微信应用: $SRC"
+    ensure_dependencies
 
     while true; do
         show_status
@@ -576,11 +652,11 @@ main() {
                 ;;
             2)
                 echo ""
-                read -p "$(echo -e ${CYAN}请输入总共需要的微信实例数量 [2-20]: ${NC})" count
-                if [[ "$count" =~ ^[0-9]+$ ]] && [ "$count" -ge 2 ] && [ "$count" -le 20 ]; then
+                read -p "$(echo -e ${CYAN}请输入总共需要的微信实例数量 [2-${MAX_TOTAL_INSTANCES}]: ${NC})" count
+                if [[ "$count" =~ ^[0-9]+$ ]] && [ "$count" -ge 2 ] && [ "$count" -le "${MAX_TOTAL_INSTANCES}" ]; then
                     batch_create "$count"
                 else
-                    warn "无效的数量，请输入 2-20 之间的数字"
+                    warn "无效的数量，请输入 2-${MAX_TOTAL_INSTANCES} 之间的数字"
                 fi
                 read -p "$(echo -e ${CYAN}按回车继续...${NC})"
                 ;;
